@@ -145,7 +145,34 @@ curl -X POST http://localhost:8765/api/config \
 
 Open `http://localhost:8765`, choose a video mode (Simple / Creative / Manuscript / Anchor), enter your idea, and click "Start Generating".
 
-### Option B: AI Agent Assisted Setup
+### Option B: Docker (Recommended)
+
+One command to start everything — no need to install Python, ffmpeg, or any dependencies locally. Docker handles it all.
+
+**Step 1 — Clone & Configure**
+
+```bash
+git clone https://github.com/uglylee/free-video-generator.git
+cd free-video-generator
+```
+
+Get a free API key from [Agnes AI](https://platform.agnes-ai.com), then create a `.env` file:
+
+```bash
+echo "AGNES_API_KEY=your-api-key" > .env
+```
+
+**Step 2 — One-Click Launch**
+
+```bash
+docker compose up -d --build
+```
+
+That's it. Open `http://localhost:8765` in your browser.
+
+> **Note**: `--build` is only needed on the first run or after code changes. On subsequent starts, just use `docker compose up -d` for faster startup. To view logs: `docker compose logs -f`. To stop: `docker compose down`.
+
+### Option C: AI Agent Assisted Setup
 
 This project is designed for AI coding assistants. First, download the code and prepare your API key:
 
