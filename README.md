@@ -7,31 +7,6 @@
 >
 > — Bruce Yang, Founder of Agnes AI
 
-**[Official Website](https://video.lichuanyang.top)** | **[Blog (Chinese)](https://lichuanyang.top/posts/22470/)** | **[Blog (English)](https://lichuanyang.top/en/posts/22470/)**
-
-> **Try it now — no install needed:** Visit [video.lichuanyang.top](https://video.lichuanyang.top) and experience **Simple Video** mode directly in your browser. Just enter a prompt and generate a free AI video instantly.
-
-## Demo
-
-### 1. Creative Video — No Narration
-
-> A dark-twist fairytale — *The Frog Prince*, 5 scenes, keyframes chaining, fully auto-generated.
-
-[![The Frog Prince — Demo Video](https://img.shields.io/badge/▶%20Watch%20Demo-FF0050?style=for-the-badge&logo=tiktok&logoColor=white)](https://v.douyin.com/L4F6KdGnD6U/)
-
-### 2. Creative Video — With TTS Narration
-
-> Same *Frog Prince* story, now with AI-generated TTS narration and auto subtitles.
-
-[![The Frog Prince with Narration — Demo](https://img.shields.io/badge/▶%20Watch%20Demo-FF0050?style=for-the-badge&logo=tiktok&logoColor=white)](https://v.douyin.com/l2FlbF1Jdz0/)
-
-### 3. Manuscript Video — Text-to-Video
-
-> Paste a long article or script → auto-split into segments → AI video per segment → unified TTS narration + subtitles → final video.
-
-[![Manuscript Video Demo](https://img.shields.io/badge/▶%20Watch%20Demo-FF0050?style=for-the-badge&logo=tiktok&logoColor=white)](https://v.douyin.com/eSGE9KENWVU/)
-
-<sub>Click to watch on Douyin</sub>
 
 ## Why Free Video Generator?
 
