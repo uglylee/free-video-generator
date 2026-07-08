@@ -1,0 +1,24 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+.working_dir/
+.workbuddy/
+.agnes_config/
+.writing/
+
+# 媒体产物（限定在工作目录下，保留根目录测试素材）
+.working_dir/**/*.mp4
+.working_dir/**/*.png
+.working_dir/**/*.jpg
+.working_dir/**/*.jpeg
+
+# 回归测试服务日志
+.regression_server.log
+
+.DS_Store
+*.egg-info/
+dist/
+build/
+static/generated/

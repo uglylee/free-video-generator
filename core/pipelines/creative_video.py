@@ -1,0 +1,2016 @@
+"""core.pipelines.creative_video -- Creative long-form video pipeline (Type 2).
+
+Ports the original ``core/pipeline.py`` VideoPipeline to the new pipeline
+architecture with audio/subtitle support (v2.0).
+
+Steps:
+    image_analysis -> story -> character_reference -> script ->
+    end_frame_prompts -> pregenerate_end_frames -> generate_videos ->
+    audio_subtitle -> concatenate
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+from typing import Callable, List, Optional
+
+from core.api.agnes_image import AgnesImageAPI
+from core.api.agnes_video import AgnesVideoAPI
+from core.audio.tts import EdgeTTSEngine, SilentTTSEngine
+from core.compositor.concatenator import VideoConcatenator
+from core.compositor.watermark import add_watermark, detect_language
+from core.config import get_watermark_config
+from core.pipelines import BasePipeline, PipelineShutdown
+from core.screenwriter import Screenwriter
+from models.task import CreativeVideoTask, SceneTask, StepStatus, SubtitleConfig
+
+_CHARS_PER_SEC = 4.0
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[。！？.!?])")
+
+def _fallback_end_frame(text: str) -> str:
+    """返回与输入文本语言一致的尾帧回退描述。"""
+    if re.search(r'[\u4e00-\u9fff]', text or ""):
+        return "电影感尾帧画面"
+    return "cinematic end frame"
+
+def _localize_transition_prompt(next_scene_text: str) -> str:
+    """返回与 next_scene_text 语言一致的过渡帧描述。"""
+    has_chinese = bool(re.search(r'[\u4e00-\u9fff]', next_scene_text or ""))
+    if has_chinese:
+        return (
+            f"电影感过渡画面，从当前场景平滑过渡到下一场景。"
+            f"保持相同的人物和面部。下一场景：{next_scene_text[:200]}"
+        )
+    return (
+        f"Cinematic transition frame, blending the end of the current scene "
+        f"into the beginning of the next. Keep the same person and face exactly. "
+        f"Next scene: {next_scene_text[:200]}"
+    )
+
+def _localize_preserve_tags(scene_text: str) -> dict:
+    """返回与场景文本语言一致的 [PRESERVE]/[CHANGE] 标签和指令。"""
+    has_chinese = bool(re.search(r'[\u4e00-\u9fff]', scene_text or ""))
+    if has_chinese:
+        return {
+            "preserve": "[保留 — 严格保持]",
+            "change": "[变化 — 过渡到本场景尾帧]",
+            "keep_identity": "保持相同的人物、相同的面部、相同的服装。不要改变身份。",
+        }
+    return {
+        "preserve": "[PRESERVE — keep exactly]",
+        "change": "[CHANGE — end frame of this scene]",
+        "keep_identity": "Keep the same person, same face, same clothing. Do NOT alter identity.",
+    }
+
+
+async def _run_ffmpeg_async(cmd: List[str], timeout: float = 30.0) -> None:
+    """异步执行 ffmpeg 命令，等价于 ``subprocess.run(cmd, check=True, timeout=...)``。
+
+    原实现用同步 ``subprocess.run`` 在 async pipeline 中阻塞事件循环，
+    导致拼接/规范化阶段冻结整个 FastAPI 服务（WS 心跳/其他任务停摆）。
+    改用 ``asyncio.create_subprocess_exec`` 让阻塞在子进程 IO 期间让出事件循环。
+
+    Args:
+        cmd: ffmpeg 命令列表。
+        timeout: 超时秒数，超时则终止子进程并抛 ``TimeoutExpired``。
+
+    Raises:
+        RuntimeError: ffmpeg 退出码非 0（等价原 ``check=True`` 语义）。
+        asyncio.TimeoutError: 超时。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace")[:500] if stderr else ""
+        raise RuntimeError(
+            f"ffmpeg exited with code {proc.returncode}: {err}"
+        )
+
+
+def _trim_to_sentence(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    candidate = text[:max_chars]
+    # find the last sentence boundary within the valid prefix
+    matches = list(_SENTENCE_BOUNDARY_RE.finditer(candidate))
+    if matches and matches[-1].end() > max_chars * 0.4:
+        return text[: matches[-1].end()]
+    return candidate[:max_chars]
+
+
+def _split_narration_into_scenes(text: str, num_scenes: int) -> list[str]:
+    """将单段旁白文本按场景数均匀切分（基于字符数比例，在句末断开）。
+
+    Args:
+        text: 旁白文本
+        num_scenes: 目标场景数
+
+    Returns:
+        每个场景的旁白文本列表。
+    """
+    if num_scenes <= 1 or not text:
+        return [text] if text else [""]
+    if num_scenes >= len(text):
+        # 极短文本：逐字分配
+        return [text[i:i+1] for i in range(len(text))] + [""] * (num_scenes - len(text))
+
+    # 在句末标点处分段，尽量均匀
+    sentences = [s.strip() for s in _SENTENCE_BOUNDARY_RE.split(text) if s.strip()]
+    if not sentences:
+        sentences = [text]
+
+    total_chars = len(text)
+    target_per_scene = total_chars / num_scenes
+
+    scenes_texts = []
+    current_text = ""
+    current_chars = 0
+
+    for sent in sentences:
+        if current_chars > 0 and (current_chars + len(sent)) / target_per_scene > 1.3:
+            scenes_texts.append(current_text)
+            current_text = sent
+            current_chars = len(sent)
+        else:
+            current_text += sent
+            current_chars += len(sent)
+
+    if current_text:
+        scenes_texts.append(current_text)
+
+    # 补足或合并到目标场景数
+    while len(scenes_texts) < num_scenes:
+        scenes_texts.append("")
+    while len(scenes_texts) > num_scenes:
+        scenes_texts[-2] += scenes_texts[-1]
+        scenes_texts.pop()
+
+    return scenes_texts
+
+
+logger = logging.getLogger(__name__)
+
+
+class CreativeVideoPipeline(BasePipeline):
+    """Creative long-form video generation pipeline with audio/subtitle support.
+
+    Generates multi-scene videos from a user idea, with optional TTS narration
+    and subtitle overlays.  Supports three chaining modes (``independent``,
+    ``chained/ti2vid``, ``keyframes``) and full resume from any completed step.
+
+    Inherits shared infrastructure (progress callbacks, shutdown control,
+    task-manager integration) from :class:`BasePipeline`.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        task_id: str,
+        dir_name: Optional[str] = None,
+        chat_model: str = "agnes-2.0-flash",
+        image_model: str = "agnes-image-2.1-flash",
+        video_model: str = "agnes-video-v2.0",
+        progress_callback: Optional[Callable] = None,
+        shutdown_event: Optional[asyncio.Event] = None,
+    ):
+        """Initialize the creative video pipeline.
+
+        Args:
+            api_key: Agnes API key for authentication.
+            task_id: Unique identifier for this task.
+            dir_name: Optional working-directory name; defaults to *task_id*.
+            chat_model: Model name for the screenwriter (LLM chat).
+            image_model: Model name for image generation (t2i).
+            video_model: Model name for video generation.
+            progress_callback: Async callable ``(step, status, message, progress, data)``
+                for reporting progress to the caller.
+            shutdown_event: External ``asyncio.Event`` that signals a graceful
+                shutdown request.
+        """
+        super().__init__(api_key, task_id, dir_name, progress_callback, shutdown_event)
+
+        self.screenwriter = Screenwriter(api_key=api_key, model=chat_model)
+        self.image_generator = AgnesImageAPI(api_key=api_key, model=image_model)
+        self.video_generator = AgnesVideoAPI(api_key=api_key, model=video_model)
+        self.video_generator.shutdown_event = shutdown_event
+
+        self._state: Optional[CreativeVideoTask] = None
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def state(self) -> Optional[CreativeVideoTask]:
+        """Current pipeline task state."""
+        return self._state
+
+    # ==================================================================
+    # Step 0: Image Analysis
+    # ==================================================================
+
+    async def _step_image_analysis(
+        self, reference_image: str, end_frame_images: list
+    ) -> str:
+        """Analyze reference and end-frame images via the screenwriter LLM.
+
+        Args:
+            reference_image: Path or URL to the user-provided reference image.
+            end_frame_images: List of paths/URLs for user-provided end frames.
+
+        Returns:
+            Image analysis text, or empty string if no images to analyze.
+        """
+        if self._state.step_image_analysis == StepStatus.COMPLETED:
+            analysis_file = self._state.image_analysis_file
+            if os.path.exists(analysis_file):
+                with open(analysis_file, "r") as f:
+                    content = f.read()
+                # 检测之前分析失败留下的错误文本，强制重新分析
+                if "(分析失败" in content:
+                    logger.warning(
+                        "[Pipeline] Step image_analysis: detected error text in saved file, re-running"
+                    )
+                    self._state.step_image_analysis = StepStatus.PENDING
+                    self.task_manager.update_step("step_image_analysis", StepStatus.PENDING)
+                else:
+                    logger.info("[Pipeline] Step image_analysis: SKIP (already completed, file exists)")
+                    return content
+            else:
+                logger.warning("[Pipeline] Step image_analysis: marked completed but file missing, re-running")
+                return ""
+
+        logger.info("[Pipeline] Step image_analysis: RUNNING")
+        images_to_analyze: List[str] = []
+        if reference_image:
+            ref_valid = reference_image.startswith(("http://", "https://")) or os.path.exists(reference_image)
+            if ref_valid:
+                images_to_analyze.append(reference_image)
+        if end_frame_images:
+            for p in end_frame_images:
+                if p and (p.startswith(("http://", "https://")) or os.path.exists(p)):
+                    images_to_analyze.append(p)
+
+        if not images_to_analyze:
+            self._state.step_image_analysis = StepStatus.COMPLETED
+            self.task_manager.update_step("step_image_analysis", StepStatus.COMPLETED)
+            return ""
+
+        await self._emit("image_analysis", "running", f"分析 {len(images_to_analyze)} 张图片...", 0.0)
+        image_context = await asyncio.to_thread(
+            self.screenwriter.describe_images, images_to_analyze,
+            cache_dir=self.working_dir,
+            language_hint=self._state.idea or "",
+        )
+
+        analysis_file = os.path.join(self.working_dir, "image_analysis.txt")
+        with open(analysis_file, "w") as f:
+            f.write(image_context)
+
+        self._state.step_image_analysis = StepStatus.COMPLETED
+        self._state.image_analysis_file = analysis_file
+        self.task_manager.update_state(
+            step_image_analysis=StepStatus.COMPLETED,
+            image_analysis_file=analysis_file,
+        )
+        await self._emit("image_analysis", "completed", f"图片分析完成 ({len(image_context)} 字符)", 0.05)
+        return image_context
+
+    # ==================================================================
+    # Step 0: Resolve Scene Configuration (v3.x)
+    # ==================================================================
+
+    async def _step_resolve_scene_config(self) -> None:
+        """Resolve scene count and per-scene durations.
+
+        Two modes:
+        - ``duration_source == "prompt"``: LLM extracts scene info from the
+          user's idea.  Aborts the task on extraction failure.
+        - ``duration_source == "manual"``: Use user-provided
+          ``scene_count`` and ``scene_durations`` directly.
+        """
+        duration_source = self._state.duration_source
+        idea = self._state.idea
+        scene_count = self._state.scene_count
+        scene_durations = list(self._state.scene_durations) if self._state.scene_durations else []
+
+        logger.info(
+            f"[Pipeline] Resolving scene config: source={duration_source}, "
+            f"manual_count={scene_count}, manual_durations={scene_durations}"
+        )
+
+        if duration_source == "prompt":
+            await self._emit(
+                "scene_config", "running",
+                "正在从创意描述中提取场景信息...", 0.01,
+            )
+            _MAX_RETRIES = 3
+            last_err = None
+            for _attempt in range(_MAX_RETRIES):
+                try:
+                    info = await asyncio.to_thread(
+                        self.screenwriter.extract_scene_info_from_idea,
+                        idea,
+                        self._state.style,
+                    )
+                    extracted_count = info["scene_count"]
+                    extracted_durations = info["durations"]
+                    self._state.scene_count = extracted_count
+                    self._state.scene_durations = extracted_durations
+                    self.task_manager.update_state(
+                        scene_count=extracted_count,
+                        scene_durations=extracted_durations,
+                    )
+                    logger.info(
+                        f"[Pipeline] Extracted from prompt: "
+                        f"{extracted_count} scenes, durations={extracted_durations}"
+                    )
+                    await self._emit(
+                        "scene_config", "completed",
+                        f"从 prompt 提取: {extracted_count} 个场景, "
+                        f"时长 {extracted_durations}",
+                        0.02,
+                        {
+                            "scene_count": extracted_count,
+                            "durations": extracted_durations,
+                            "source": "prompt",
+                        },
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if _attempt < _MAX_RETRIES - 1:
+                        wait_sec = 15 * (_attempt + 1)
+                        logger.warning(
+                            f"[Pipeline] Scene info extraction failed (attempt {_attempt+1}/{_MAX_RETRIES}): {e}. "
+                            f"Retrying in {wait_sec}s..."
+                        )
+                        await self._emit(
+                            "scene_config", "running",
+                            f"提取失败，{wait_sec}秒后重试 ({_attempt+1}/{_MAX_RETRIES})...", 0.01,
+                        )
+                        await asyncio.sleep(wait_sec)
+
+            if last_err is not None:
+                logger.error(f"[Pipeline] Failed to extract scene info after {_MAX_RETRIES} attempts: {last_err}")
+                await self._emit(
+                    "scene_config", "failed",
+                    f"无法从创意描述中提取场景信息: {last_err}",
+                    0.0,
+                )
+                raise PipelineShutdown(
+                    f"场景信息提取失败（已重试 {_MAX_RETRIES} 次）: {last_err}. "
+                    f"请手动设置场景数和每场景时长后重试。"
+                ) from last_err
+        else:
+            # manual mode: apply user-provided values
+            if scene_count <= 0:
+                scene_count = 1
+                self._state.scene_count = scene_count
+            if not scene_durations:
+                # fallback: all scenes 5s
+                scene_durations = [5] * scene_count
+            elif len(scene_durations) < scene_count:
+                # pad with last value
+                while len(scene_durations) < scene_count:
+                    scene_durations.append(scene_durations[-1])
+            elif len(scene_durations) > scene_count:
+                scene_durations = scene_durations[:scene_count]
+
+            self._state.scene_durations = scene_durations
+            self.task_manager.update_state(
+                scene_count=scene_count,
+                scene_durations=scene_durations,
+            )
+            logger.info(
+                f"[Pipeline] Manual scene config: "
+                f"{scene_count} scenes, durations={scene_durations}"
+            )
+            await self._emit(
+                "scene_config", "completed",
+                f"场景配置: {scene_count} 个场景, "
+                f"时长 {scene_durations}",
+                0.02,
+                {
+                    "scene_count": scene_count,
+                    "durations": scene_durations,
+                    "source": "manual",
+                },
+            )
+
+        self._state.step_scene_config = StepStatus.COMPLETED
+        self.task_manager.update_step(
+            "step_scene_config", StepStatus.COMPLETED
+        )
+
+    # ==================================================================
+    # Step 1: Story
+    # ==================================================================
+
+    async def _step_story(self, image_context: str) -> str:
+        """Develop a story from the user idea, requirements, style, and image context.
+
+        Args:
+            image_context: Text from the image-analysis step (may be empty).
+
+        Returns:
+            Generated story text.
+        """
+        if self._state.step_story == StepStatus.COMPLETED:
+            story_path = self._state.story_file
+            if os.path.exists(story_path):
+                logger.info("[Pipeline] Step story: SKIP (already completed, file exists)")
+                with open(story_path, "r") as f:
+                    return f.read()
+            logger.warning("[Pipeline] Step story: marked completed but file missing, re-running")
+
+        logger.info("[Pipeline] Step story: RUNNING")
+        await self._emit("story", "running", "正在生成故事...", 0.05)
+        story = await asyncio.to_thread(
+            self.screenwriter.develop_story,
+            self._state.idea,
+            "",
+            self._state.style,
+            image_context,
+            self._state.scene_count,
+            self._state.scene_durations,
+            self._state.include_characters,
+        )
+
+        story_path = os.path.join(self.working_dir, "story.txt")
+        with open(story_path, "w") as f:
+            f.write(story)
+
+        self._state.step_story = StepStatus.COMPLETED
+        self._state.story_file = story_path
+        self.task_manager.update_state(
+            step_story=StepStatus.COMPLETED,
+            story_file=story_path,
+        )
+        await self._emit("story", "completed", f"故事生成完成 ({len(story)} 字符)", 0.1)
+        return story
+
+    # ==================================================================
+    # Step 2: Character Reference
+    # ==================================================================
+
+    async def _step_character_reference(self, story: str) -> str:
+        """Generate or reuse a character reference image.
+
+        If include_characters is False, this step is skipped entirely.
+        If the user supplied a reference image it is returned directly.
+        Otherwise a character description is extracted from *story* and fed
+        to the image generator (t2i).
+
+        Args:
+            story: Generated story text from Step 1.
+
+        Returns:
+            File path to the character reference image, or "" if skipped.
+        """
+        # 无人物模式：直接跳过
+        if not self._state.include_characters:
+            logger.info("[Pipeline] Step character_ref: SKIP (include_characters=False)")
+            self._state.step_character_ref = StepStatus.COMPLETED
+            self.task_manager.update_state(step_character_ref=StepStatus.COMPLETED)
+            await self._emit("character_ref", "completed", "无人物模式，跳过角色参考图", 0.15)
+            return ""
+
+        if self._state.step_character_ref == StepStatus.COMPLETED:
+            ref_path = self._state.character_ref_file
+            if ref_path and os.path.exists(ref_path):
+                logger.info("[Pipeline] Step character_ref: SKIP (already completed, file exists)")
+                return ref_path
+            logger.warning("[Pipeline] Step character_ref: marked completed but file missing, re-running")
+
+        if self._state.reference_image:
+            logger.info("[Pipeline] Step character_ref: SKIP (user-provided reference image)")
+            self._state.step_character_ref = StepStatus.COMPLETED
+            self._state.character_ref_file = self._state.reference_image
+            self.task_manager.update_state(
+                step_character_ref=StepStatus.COMPLETED,
+                character_ref_file=self._state.reference_image,
+            )
+            await self._emit("character_ref", "completed", "使用用户提供的参考图", 0.15)
+            return self._state.reference_image
+
+        ref_prompt_path = os.path.join(self.working_dir, "character_ref_prompt.txt")
+        ref_img_path = os.path.join(self.working_dir, "character_reference.png")
+
+        if os.path.exists(ref_img_path) and os.path.exists(ref_prompt_path):
+            self._state.step_character_ref = StepStatus.COMPLETED
+            self._state.character_ref_file = ref_img_path
+            with open(ref_prompt_path, "r") as f:
+                self._state.character_ref_prompt = f.read()
+            self.task_manager.update_state(
+                step_character_ref=StepStatus.COMPLETED,
+                character_ref_file=ref_img_path,
+            )
+            await self._emit("character_ref", "completed", "角色参考图已缓存", 0.15)
+            return ref_img_path
+
+        await self._emit("character_ref", "running", "正在提取角色描述并生成参考图...", 0.1)
+        char_prompt = await asyncio.to_thread(
+            self.screenwriter.extract_character_description, story, self._state.style
+        )
+        with open(ref_prompt_path, "w") as f:
+            f.write(char_prompt)
+
+        await self._emit("character_ref", "running", "正在生成角色参考图 (t2i)...", 0.12)
+        img_output = await self.image_generator.generate_single_image(
+            prompt=char_prompt,
+            size=f"{self._state.video_width}x{self._state.video_height}",
+        )
+        img_output.save(ref_img_path)
+
+        self._state.step_character_ref = StepStatus.COMPLETED
+        self._state.character_ref_prompt = char_prompt
+        self._state.character_ref_file = ref_img_path
+        self.task_manager.update_state(
+            step_character_ref=StepStatus.COMPLETED,
+            character_ref_prompt=char_prompt,
+            character_ref_file=ref_img_path,
+        )
+        await self._emit("character_ref", "completed", "角色参考图生成完成", 0.15)
+        return ref_img_path
+
+    # ==================================================================
+    # Step 3: Script
+    # ==================================================================
+
+    async def _step_script(self, story: str) -> list:
+        """Write a scene-by-scene script from the story.
+
+        Args:
+            story: Generated story text.
+
+        Returns:
+            List of scene descriptions (dicts or strings).
+        """
+        if self._state.step_script == StepStatus.COMPLETED:
+            script_path = self._state.script_file
+            if os.path.exists(script_path):
+                logger.info("[Pipeline] Step script: SKIP (already completed, file exists)")
+                with open(script_path, "r") as f:
+                    scenes = json.load(f)
+                if self._state.scene_count == len(scenes):
+                    return scenes
+                logger.warning("[Pipeline] Step script: scene count mismatch, re-running")
+            else:
+                logger.warning("[Pipeline] Step script: marked completed but file missing, re-running")
+
+        logger.info("[Pipeline] Step script: RUNNING")
+        await self._emit("script", "running", "正在编写脚本...", 0.15)
+        scenes = await asyncio.to_thread(
+            self.screenwriter.write_script, story, "",
+            self._state.style,
+            self._state.scene_count,
+            self._state.scene_durations,
+            self._state.include_characters,
+        )
+
+        script_path = os.path.join(self.working_dir, "script.json")
+        with open(script_path, "w") as f:
+            json.dump(scenes, f, ensure_ascii=False, indent=2)
+
+        self._state.scene_count = len(scenes)
+        # Map durations to scenes: use scene_durations list, pad/trim as needed
+        durations = list(self._state.scene_durations) if self._state.scene_durations else []
+        if not durations:
+            durations = [int(self._state.video_duration)] * len(scenes)
+        elif len(durations) < len(scenes):
+            while len(durations) < len(scenes):
+                durations.append(durations[-1])
+        elif len(durations) > len(scenes):
+            durations = durations[:len(scenes)]
+
+        if not self._state.scenes:
+            self._state.scenes = [
+                SceneTask(index=i, duration=durations[i] if i < len(durations) else 5)
+                for i in range(len(scenes))
+            ]
+        elif len(self._state.scenes) != len(scenes):
+            # Re-create scenes to match new scene count (resume with different config)
+            self._state.scenes = [
+                SceneTask(index=i, duration=durations[i] if i < len(durations) else 5)
+                for i in range(len(scenes))
+            ]
+        else:
+            # Update existing scenes' durations from the resolved config
+            for i, scene_obj in enumerate(self._state.scenes):
+                if i < len(durations):
+                    scene_obj.duration = durations[i]
+
+        self._state.scene_durations = durations
+        logger.info(
+            f"[Pipeline] Script: {len(scenes)} scenes, "
+            f"durations={[s.duration for s in self._state.scenes]}"
+        )
+
+        self._state.step_script = StepStatus.COMPLETED
+        self._state.script_file = script_path
+        self.task_manager.update_state(
+            step_script=StepStatus.COMPLETED,
+            script_file=script_path,
+            scene_count=len(scenes),
+            scenes=[s.model_dump() for s in self._state.scenes],
+        )
+        await self._emit("script", "completed", f"脚本完成，共 {len(scenes)} 个场景", 0.2)
+        return scenes
+
+    # ==================================================================
+    # Step 3.5: End Frame Prompts (keyframes mode)
+    # ==================================================================
+
+    async def _step_end_frame_prompts(self, story: str, scenes: list) -> list:
+        """Generate end-frame prompt for each scene (keyframes mode only).
+
+        Args:
+            story: Generated story text.
+            scenes: List of scene descriptions from the script step.
+
+        Returns:
+            List of end-frame prompt strings, or empty list when not in
+            keyframes mode.
+        """
+        if self._state.chaining_mode != "keyframes":
+            return []
+
+        if self._state.step_end_frame_prompts == StepStatus.COMPLETED:
+            prompts_path = self._state.end_frame_prompts_file
+            if os.path.exists(prompts_path):
+                logger.info("[Pipeline] Step end_frame_prompts: SKIP (already completed, file exists)")
+                with open(prompts_path, "r") as f:
+                    return json.load(f)
+            logger.warning("[Pipeline] Step end_frame_prompts: marked completed but file missing, re-running")
+
+        logger.info("[Pipeline] Step end_frame_prompts: RUNNING")
+        await self._emit("end_frame_prompts", "running", "正在生成尾帧提示词...", 0.2)
+        character_appearance = await asyncio.to_thread(
+            self.screenwriter.get_character_appearance, story
+        )
+        # 持久化角色外观文本，支持断点续传一致性（批次3）
+        self._state.character_appearance = character_appearance
+        self.task_manager.update_state(character_appearance=character_appearance)
+        end_frame_prompts = await asyncio.to_thread(
+            self.screenwriter.generate_end_frame_prompts,
+            scenes, self._state.style, character_appearance
+        )
+
+        prompts_path = os.path.join(self.working_dir, "end_frame_prompts.json")
+        with open(prompts_path, "w") as f:
+            json.dump(end_frame_prompts, f, ensure_ascii=False, indent=2)
+
+        self._state.step_end_frame_prompts = StepStatus.COMPLETED
+        self._state.end_frame_prompts_file = prompts_path
+        self.task_manager.update_state(
+            step_end_frame_prompts=StepStatus.COMPLETED,
+            end_frame_prompts_file=prompts_path,
+        )
+        await self._emit("end_frame_prompts", "completed", f"尾帧提示词完成，共 {len(end_frame_prompts)} 个", 0.25)
+        return end_frame_prompts
+
+    # ==================================================================
+    # Helpers: image normalization
+    # ==================================================================
+
+    @staticmethod
+    async def _normalize_image_to_size(src: str, vw: int, vh: int, dst: str) -> str:
+        """Normalize an image to exactly ``vw x vh`` using ffmpeg scale+pad.
+
+        Keeps the original aspect ratio (no stretching) and pads with black
+        bars. This avoids feeding i2i a composition that the model would
+        otherwise stretch/letterbox unpredictably — the i2i model then only
+        needs to preserve identity, not reshape the layout.
+
+        Uses ``_run_ffmpeg_async`` to avoid blocking the event loop.
+
+        Args:
+            src: Source image path.
+            vw: Target width.
+            vh: Target height.
+            dst: Destination path. If it already exists it is reused (cache).
+
+        Returns:
+            Path to the normalized image (``dst``).
+        """
+        if os.path.exists(dst):
+            logger.debug(f"[Pipeline] normalize cache hit: {dst}")
+            return dst
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        await _run_ffmpeg_async(
+            [
+                "ffmpeg", "-y", "-i", src,
+                "-vf",
+                f"scale={vw}:{vh}:force_original_aspect_ratio=decrease,"
+                f"pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2",
+                dst,
+            ],
+            timeout=30,
+        )
+        return dst
+
+    async def _get_normalized_character_ref(self, character_ref_path: str) -> str:
+        """Return a character-reference image normalized to the video size.
+
+        Caches the result under ``working_dir/character_ref_normalized.png``
+        so it is generated at most once per task. Returns the original path
+        unchanged if normalization is not possible (e.g. path is a URL).
+
+        Args:
+            character_ref_path: Original character reference path or URL.
+
+        Returns:
+            Path to the normalized image, or the original path on failure.
+        """
+        vw = self._state.video_width
+        vh = self._state.video_height
+        if not character_ref_path:
+            return character_ref_path
+        # Only normalize local files; URLs/data: are passed through as-is.
+        if character_ref_path.startswith(("http://", "https://", "data:")):
+            return character_ref_path
+        if not os.path.exists(character_ref_path):
+            return character_ref_path
+        dst = os.path.join(self.working_dir, "character_ref_normalized.png")
+        try:
+            return await self._normalize_image_to_size(character_ref_path, vw, vh, dst)
+        except Exception as e:
+            logger.warning(
+                f"[Pipeline] normalize character ref failed ({e}), using original"
+            )
+            return character_ref_path
+
+    # ==================================================================
+    # Step 3.6: Pre-generate End Frames (keyframes mode)
+    # ==================================================================
+
+    async def _step_pregenerate_end_frames(
+        self, scenes: list, end_frame_prompts: list, character_ref_path: str
+    ) -> dict:
+        """Pre-generate end-frame images for every scene (keyframes mode only).
+
+        Args:
+            scenes: List of scene descriptions.
+            end_frame_prompts: Per-scene end-frame prompt strings.
+            character_ref_path: Path to the character reference image.
+
+        Returns:
+            Dict mapping ``str(scene_idx)`` to end-frame file paths, or
+            empty dict when not in keyframes mode.
+        """
+        if self._state.chaining_mode != "keyframes":
+            return {}
+
+        if self._state.step_end_frame_generation == StepStatus.COMPLETED:
+            cached_frames = self._state.pregenerated_end_frames or {}
+            # 验证缓存的文件是否实际存在（防止标记 completed 但文件丢失）
+            all_exist = all(
+                os.path.exists(p) for p in cached_frames.values()
+            ) if cached_frames else False
+            if all_exist:
+                logger.info("[Pipeline] Step end_frame_gen: SKIP (already completed)")
+                return cached_frames
+            logger.warning(
+                "[Pipeline] Step end_frame_gen: marked completed but some files missing, re-running"
+            )
+            self._state.step_end_frame_generation = StepStatus.PENDING
+            self.task_manager.update_step("step_end_frame_generation", StepStatus.PENDING)
+
+        logger.info(f"[Pipeline] Step end_frame_gen: RUNNING ({len(end_frame_prompts)} frames)")
+
+        vw = self._state.video_width
+        vh = self._state.video_height
+        end_frame_images = self._state.end_frame_images
+
+        pregenerated: dict = {}
+        cached = self._state.pregenerated_end_frames or {}
+        # 批次5：维护上一场景尾帧路径，用于多图 i2i 场景间视觉链
+        prev_end_frame: Optional[str] = None
+
+        for scene_idx in range(len(scenes)):
+            if self._is_shutdown():
+                raise PipelineShutdown(f"interrupted during end frame gen scene {scene_idx}")
+            scene_dir = os.path.join(self.working_dir, f"scene_{scene_idx}")
+            os.makedirs(scene_dir, exist_ok=True)
+            end_frame_path = os.path.join(scene_dir, "end_frame.png")
+
+            if str(scene_idx) in cached and os.path.exists(end_frame_path):
+                pregenerated[scene_idx] = end_frame_path
+                prev_end_frame = end_frame_path  # 维护视觉链
+                continue
+
+            user_ef = (
+                end_frame_images[scene_idx]
+                if end_frame_images and scene_idx < len(end_frame_images) and end_frame_images[scene_idx]
+                else None
+            )
+
+            if user_ef:
+                await self._emit(
+                    "end_frame_gen", "running",
+                    f"场景 {scene_idx+1}/{len(scenes)}: 使用自定义尾帧",
+                    0.25 + 0.05 * scene_idx / len(scenes),
+                )
+                if os.path.exists(user_ef):
+                    dest = os.path.join(scene_dir, "end_frame.png")
+                    await _run_ffmpeg_async(
+                        [
+                            "ffmpeg", "-y", "-i", user_ef,
+                            "-vf", f"scale={vw}:{vh}:force_original_aspect_ratio=decrease,pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2",
+                            dest,
+                        ],
+                        timeout=30,
+                    )
+                    end_frame_path = dest
+                pregenerated[scene_idx] = end_frame_path
+                cached[str(scene_idx)] = end_frame_path
+                prev_end_frame = end_frame_path  # 维护视觉链
+                continue
+
+            if os.path.exists(end_frame_path):
+                pregenerated[scene_idx] = end_frame_path
+                cached[str(scene_idx)] = end_frame_path
+                prev_end_frame = end_frame_path  # 维护视觉链
+                continue
+
+            if self._state.generate_end_frames_from_ref and character_ref_path:
+                await self._emit(
+                    "end_frame_gen", "running",
+                    f"场景 {scene_idx+1}/{len(scenes)}: 基于参考图生成尾帧 (i2i)",
+                    0.25 + 0.05 * scene_idx / len(scenes),
+                )
+                end_frame_prompt = (
+                    end_frame_prompts[scene_idx]
+                    if scene_idx < len(end_frame_prompts)
+                    else _fallback_end_frame(scenes[scene_idx])
+                )
+                # 程序化拼入 [PRESERVE] 角色外观硬约束，确保 i2i 身份一致性（批次3）
+                # 用户提供了参考图时跳过：文本描述从故事提取，可能与参考图衣着矛盾，
+                # 此时让 i2i 模型直接看参考图保持身份一致性。
+                if self._state.character_appearance and not self._state.reference_image:
+                    _tags = _localize_preserve_tags(scenes[scene_idx])
+                    end_frame_prompt = (
+                        f"{_tags['preserve']}\n"
+                        f"{self._state.character_appearance}\n"
+                        f"{_tags['keep_identity']}\n\n"
+                        f"{_tags['change']}\n"
+                        f"{end_frame_prompt}"
+                    )
+                # 规范化角色参考图到目标尺寸，避免 i2i 拉伸/构图错位
+                normalized_ref = await self._get_normalized_character_ref(character_ref_path)
+                # 批次5：多图 i2i 引导 —— 角色图锁身份 + 上一场景尾帧锁环境/风格延续
+                ref_images = [normalized_ref]
+                if prev_end_frame and os.path.exists(prev_end_frame):
+                    ref_images.append(prev_end_frame)
+                    logger.info(
+                        f"[EndFrame] Scene {scene_idx}: multi-ref i2i "
+                        f"(character + prev scene {scene_idx-1} end frame)"
+                    )
+                for attempt in range(3):
+                    if self._is_shutdown():
+                        raise PipelineShutdown(f"interrupted during end frame gen scene {scene_idx}")
+                    try:
+                        img_output = await self.image_generator.generate_single_image(
+                            prompt=end_frame_prompt,
+                            reference_image_paths=ref_images,
+                            size=f"{vw}x{vh}",
+                        )
+                        img_output.save(end_frame_path)
+                        pregenerated[scene_idx] = end_frame_path
+                        cached[str(scene_idx)] = end_frame_path
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            wait = (attempt + 1) * 20
+                            logger.warning(
+                                f"[EndFrame] Scene {scene_idx} attempt {attempt+1} failed: {e}, "
+                                f"retrying in {wait}s..."
+                            )
+                            await asyncio.sleep(wait)
+                        else:
+                            logger.error(f"[EndFrame] Scene {scene_idx} failed after 3 attempts: {e}")
+                            raise
+            else:
+                end_frame_prompt = (
+                    end_frame_prompts[scene_idx]
+                    if scene_idx < len(end_frame_prompts)
+                    else _fallback_end_frame(scenes[scene_idx])
+                )
+                await self._emit(
+                    "end_frame_gen", "running",
+                    f"场景 {scene_idx+1}/{len(scenes)}: 自动生成尾帧 (t2i)",
+                    0.25 + 0.05 * scene_idx / len(scenes),
+                )
+                img_output = await self.image_generator.generate_single_image(
+                    prompt=end_frame_prompt,
+                    size=f"{vw}x{vh}",
+                )
+                img_output.save(end_frame_path)
+                pregenerated[scene_idx] = end_frame_path
+                cached[str(scene_idx)] = end_frame_path
+
+            # 维护视觉链：所有路径（i2i/t2i）生成完毕后更新 prev_end_frame
+            prev_end_frame = end_frame_path
+
+            if scene_idx < len(scenes) - 1:
+                await asyncio.sleep(2)
+
+        self._state.pregenerated_end_frames = cached
+        self._state.step_end_frame_generation = StepStatus.COMPLETED
+        self.task_manager.update_state(
+            pregenerated_end_frames=cached,
+            step_end_frame_generation=StepStatus.COMPLETED,
+        )
+        await self._emit(
+            "end_frame_gen", "completed",
+            f"尾帧预生成全部完成 ({len(pregenerated)}/{len(scenes)})",
+            0.35,
+        )
+        return pregenerated
+
+    # ==================================================================
+    # Step 4: Video Generation
+    # ==================================================================
+
+    def _make_curl(self, video_id: str) -> str:
+        """Build a curl command string for manual video-task retrieval.
+
+        Args:
+            video_id: The remote video task identifier.
+
+        Returns:
+            Shell command string.
+        """
+        return (
+            f'curl -s -H "Authorization: Bearer $AGNES_API_KEY" '
+            f'"https://apihub.agnes-ai.com/agnesapi?video_id={video_id}"'
+        )
+
+    def _save_scene_task(self, scene_dir: str, video_id: str) -> None:
+        """Persist a scene's video-task ID to ``task.json`` and ``curl.sh``.
+
+        Args:
+            scene_dir: Directory for the scene.
+            video_id: Remote video task identifier.
+        """
+        task_file = os.path.join(scene_dir, "task.json")
+        with open(task_file, "w") as f:
+            json.dump({"video_id": video_id}, f, indent=2)
+        curl_file = os.path.join(scene_dir, "curl.sh")
+        with open(curl_file, "w") as f:
+            f.write(self._make_curl(video_id) + "\n")
+
+    def _load_scene_task(self, scene_dir: str) -> Optional[str]:
+        """Load a previously saved video-task ID from ``task.json``.
+
+        Args:
+            scene_dir: Directory for the scene.
+
+        Returns:
+            The video/task ID string, or ``None`` if no task file exists.
+        """
+        task_file = os.path.join(scene_dir, "task.json")
+        if os.path.exists(task_file):
+            try:
+                with open(task_file, "r") as f:
+                    data = json.load(f)
+                return data.get("video_id") or data.get("task_id")
+            except Exception as e:
+                logger.debug(f"[Pipeline] Failed to load cached task.json for scene: {e}")
+        return None
+
+    async def _step_generate_videos(
+        self,
+        scenes: list,
+        character_ref_path: str,
+        end_frame_prompts: list,
+        pregenerated_end_frames: dict,
+    ) -> list:
+        """Generate videos for all scenes using the configured chaining mode.
+
+        Dispatches to one of three generation strategies:
+        - ``keyframes``: first-frame / end-frame pair for each scene.
+        - ``ti2vid``: chained scenes where each uses the previous last frame.
+        - ``independent``: every scene is generated independently.
+
+        Args:
+            scenes: List of scene descriptions.
+            character_ref_path: Path to the character reference image.
+            end_frame_prompts: Per-scene end-frame prompts (keyframes mode).
+            pregenerated_end_frames: Pre-generated end-frame paths (keyframes mode).
+
+        Returns:
+            Ordered list of video file paths.
+        """
+        if self._state.step_video_generation == StepStatus.COMPLETED:
+            logger.info("[Pipeline] Step video_gen: SKIP (already completed), reconstructing video paths from disk")
+            all_video_paths = []
+            for scene_idx in range(len(scenes)):
+                video_path = os.path.join(self.working_dir, f"scene_{scene_idx}", "video.mp4")
+                if os.path.exists(video_path):
+                    all_video_paths.append(video_path)
+            # 验证所有场景的视频文件都存在
+            if len(all_video_paths) == len(scenes):
+                logger.info(f"[Pipeline] Step video_gen: reconstructed {len(all_video_paths)} video paths from disk")
+                return all_video_paths
+            logger.warning(
+                f"[Pipeline] Step video_gen: marked completed but only {len(all_video_paths)}/{len(scenes)} "
+                "videos exist, re-running"
+            )
+            self._state.step_video_generation = StepStatus.PENDING
+            self.task_manager.update_step("step_video_generation", StepStatus.PENDING)
+
+        logger.info(
+            f"[Pipeline] Step video_gen: RUNNING "
+            f"({len(scenes)} scenes, mode={self._state.chaining_mode})"
+        )
+
+        vw = self._state.video_width
+        vh = self._state.video_height
+        chaining_mode = self._state.chaining_mode
+        end_frame_images = self._state.end_frame_images
+
+        if chaining_mode == "keyframes":
+            all_video_paths = await self._generate_keyframe_scenes(
+                scenes, character_ref_path, end_frame_prompts,
+                pregenerated_end_frames, vw, vh, end_frame_images,
+            )
+        elif chaining_mode == "ti2vid":
+            all_video_paths = await self._generate_chained_scenes(
+                scenes, character_ref_path, vw, vh,
+            )
+        else:
+            all_video_paths = await self._generate_independent_scenes(
+                scenes, character_ref_path, vw, vh,
+            )
+
+        self._state.step_video_generation = StepStatus.COMPLETED
+        self.task_manager.update_step("step_video_generation", StepStatus.COMPLETED)
+        return all_video_paths
+
+    # ------------------------------------------------------------------
+    # Video generation strategies
+    # ------------------------------------------------------------------
+
+    def _scene_duration(self, scene_idx: int) -> float:
+        """Get the video duration for a specific scene by index.
+
+        Falls back to ``self._state.video_duration`` when the scene object
+        is not available (e.g. before scenes are created).
+        """
+        if scene_idx < len(self._state.scenes):
+            return float(self._state.scenes[scene_idx].duration)
+        return float(self._state.video_duration)
+
+    async def _generate_independent_scenes(
+        self, scenes: list, character_ref_path: str, vw: int, vh: int
+    ) -> list:
+        """Generate all scenes independently (no chaining).
+
+        Phase 1 submits all video tasks; Phase 2 waits for them to complete.
+
+        Args:
+            scenes: Scene description list.
+            character_ref_path: Path to the character reference image.
+            vw: Video width in pixels.
+            vh: Video height in pixels.
+
+        Returns:
+            Ordered list of video file paths.
+        """
+        total = len(scenes)
+        pending: List[dict] = []
+
+        # Phase 1: Submit all video tasks, saving scene state for resumability
+        for scene_idx, scene_text in enumerate(scenes):
+            if self._is_shutdown():
+                raise PipelineShutdown(f"interrupted during independent scene {scene_idx}")
+            scene_dir = os.path.join(self.working_dir, f"scene_{scene_idx}")
+            os.makedirs(scene_dir, exist_ok=True)
+            video_path = os.path.join(scene_dir, "video.mp4")
+
+            if os.path.exists(video_path):
+                continue
+
+            existing_video_id = self._load_scene_task(scene_dir)
+            if existing_video_id:
+                logger.info(
+                    f"[Pipeline] Scene {scene_idx}: resuming existing video task "
+                    f"{existing_video_id[:16]}..."
+                )
+                pending.append({
+                    "scene_idx": scene_idx, "video_path": video_path,
+                    "video_id": existing_video_id, "scene_dir": scene_dir,
+                    "already_submitted": True,
+                })
+                continue
+
+            await self._emit(
+                "video_gen", "running",
+                f"场景 {scene_idx+1}/{total}: 提交任务 (ti2vid)...",
+                0.35 + 0.45 * scene_idx / total,
+            )
+            video_id = await self.video_generator.submit_video(
+                prompt=scene_text,
+                reference_image_paths=[character_ref_path],
+                duration=self._scene_duration(scene_idx),
+                width=vw,
+                height=vh,
+                negative_prompt=self._state.negative_prompt or None,
+            )
+            self._save_scene_task(scene_dir, video_id)
+            pending.append({
+                "scene_idx": scene_idx, "video_path": video_path,
+                "video_id": video_id, "scene_dir": scene_dir,
+                "already_submitted": True,
+            })
+
+        if pending:
+            await self._emit(
+                "video_gen", "running",
+                f"等待 {len(pending)} 个视频生成完成 (independent)...",
+                0.38,
+            )
+
+        # Phase 2: Wait for all submitted videos
+        for info in pending:
+            scene_idx = info["scene_idx"]
+            await self._emit(
+                "video_gen", "running",
+                f"场景 {scene_idx+1}/{total}: 等待生成中...",
+                0.38 + 0.42 * pending.index(info) / len(pending),
+            )
+            try:
+                video_output = await self.video_generator.wait_for_video(info["video_id"])
+                video_output.save(info["video_path"])
+                await self._emit(
+                    "video_gen", "running",
+                    f"场景 {scene_idx+1}/{total}: 完成",
+                    0.38 + 0.42 * (pending.index(info) + 1) / len(pending),
+                )
+            except Exception as e:
+                logger.error(f"Scene {scene_idx} video failed: {e}")
+                task_file = os.path.join(info["scene_dir"], "task.json")
+                if os.path.exists(task_file):
+                    os.remove(task_file)
+                raise
+
+        all_video_paths: List[str] = []
+        for scene_idx in range(len(scenes)):
+            video_path = os.path.join(self.working_dir, f"scene_{scene_idx}", "video.mp4")
+            if os.path.exists(video_path):
+                all_video_paths.append(video_path)
+
+        return all_video_paths
+
+    async def _generate_chained_scenes(
+        self, scenes: list, reference_image: str, vw: int, vh: int
+    ) -> list:
+        """Generate scenes in a chain where each uses the previous last frame.
+
+        Args:
+            scenes: Scene description list.
+            reference_image: Initial reference image for the first scene.
+            vw: Video width in pixels.
+            vh: Video height in pixels.
+
+        Returns:
+            Ordered list of video file paths.
+        """
+        all_video_paths: List[str] = []
+        current_image = reference_image
+        total = len(scenes)
+
+        for scene_idx, scene_text in enumerate(scenes):
+            if self._is_shutdown():
+                raise PipelineShutdown(f"interrupted during chained scene {scene_idx}")
+            scene_dir = os.path.join(self.working_dir, f"scene_{scene_idx}")
+            os.makedirs(scene_dir, exist_ok=True)
+            video_path = os.path.join(scene_dir, "video.mp4")
+
+            if os.path.exists(video_path):
+                all_video_paths.append(video_path)
+                last_frame_path = os.path.join(scene_dir, "last_frame.jpg")
+                if os.path.exists(last_frame_path):
+                    current_image = last_frame_path
+                await self._emit(
+                    "video_gen", "running",
+                    f"场景 {scene_idx+1}/{total}: 已缓存",
+                    0.35 + 0.45 * (scene_idx + 1) / total,
+                )
+                continue
+
+            # Check for previously submitted but unwatched task
+            existing_video_id = self._load_scene_task(scene_dir)
+
+            if existing_video_id:
+                logger.info(
+                    f"[Pipeline] Scene {scene_idx}: resuming existing video task "
+                    f"{existing_video_id[:16]}..."
+                )
+                await self._emit(
+                    "video_gen", "running",
+                    f"场景 {scene_idx+1}/{total}: 续传视频 (ti2vid)...",
+                    0.35 + 0.45 * scene_idx / total,
+                )
+            else:
+                await self._emit(
+                    "video_gen", "running",
+                    f"场景 {scene_idx+1}/{total}: 提交任务 (ti2vid)...",
+                    0.35 + 0.45 * scene_idx / total,
+                )
+                video_id = await self.video_generator.submit_video(
+                    prompt=scene_text,
+                    reference_image_paths=[current_image],
+                    duration=self._scene_duration(scene_idx),
+                    width=vw,
+                    height=vh,
+                    negative_prompt=self._state.negative_prompt or None,
+                )
+                self._save_scene_task(scene_dir, video_id)
+                existing_video_id = video_id
+
+            await self._emit(
+                "video_gen", "running",
+                f"场景 {scene_idx+1}/{total}: 等待生成中...",
+                0.35 + 0.45 * scene_idx / total,
+            )
+            try:
+                video_output = await self.video_generator.wait_for_video(existing_video_id)
+                video_output.save(video_path)
+            except Exception as e:
+                logger.error(f"Scene {scene_idx} video failed: {e}")
+                task_file = os.path.join(scene_dir, "task.json")
+                if os.path.exists(task_file):
+                    os.remove(task_file)
+                raise
+
+            all_video_paths.append(video_path)
+
+            if scene_idx + 1 < total:
+                last_frame_path = os.path.join(scene_dir, "last_frame.jpg")
+                await _run_ffmpeg_async(
+                    [
+                        "ffmpeg", "-y",
+                        "-sseof", "-1",
+                        "-i", video_path,
+                        "-frames:v", "1",
+                        "-update", "1",
+                        last_frame_path,
+                    ],
+                    timeout=30,
+                )
+
+                last_frame_url = await self.video_generator._resolve_image_ref(last_frame_path)
+
+                next_scene_text = scenes[scene_idx + 1]
+                transition_prompt = _localize_transition_prompt(next_scene_text)
+                transition_path = os.path.join(scene_dir, f"transition_to_{scene_idx+1}.png")
+
+                img_output = await self.image_generator.generate_single_image(
+                    prompt=transition_prompt,
+                    reference_image_paths=[last_frame_url],
+                    size=f"{vw}x{vh}",
+                )
+                img_output.save(transition_path)
+                current_image = transition_path
+
+            await self._emit(
+                "video_gen", "running",
+                f"场景 {scene_idx+1}/{total}: 完成",
+                0.35 + 0.45 * (scene_idx + 1) / total,
+            )
+
+        return all_video_paths
+
+    async def _generate_keyframe_scenes(
+        self,
+        scenes: list,
+        reference_image: str,
+        end_frame_prompts: list,
+        pregenerated_end_frames: dict,
+        vw: int,
+        vh: int,
+        end_frame_images: list,
+    ) -> list:
+        """Generate scenes using first-frame / end-frame keyframe pairs.
+
+        Args:
+            scenes: Scene description list.
+            reference_image: Initial first-frame reference image.
+            end_frame_prompts: Per-scene end-frame prompt strings.
+            pregenerated_end_frames: Dict of pre-generated end-frame paths.
+            vw: Video width in pixels.
+            vh: Video height in pixels.
+            end_frame_images: User-provided end-frame image paths.
+
+        Returns:
+            Ordered list of video file paths.
+        """
+        current_first_frame = reference_image
+        total = len(scenes)
+
+        pending: List[dict] = []
+        for scene_idx, scene_text in enumerate(scenes):
+            if self._is_shutdown():
+                raise PipelineShutdown(f"interrupted during keyframe scene {scene_idx}")
+            scene_dir = os.path.join(self.working_dir, f"scene_{scene_idx}")
+            os.makedirs(scene_dir, exist_ok=True)
+            video_path = os.path.join(scene_dir, "video.mp4")
+
+            if os.path.exists(video_path):
+                end_frame_path = os.path.join(scene_dir, "end_frame.png")
+                if os.path.exists(end_frame_path):
+                    current_first_frame = end_frame_path
+                continue
+
+            existing_video_id = self._load_scene_task(scene_dir)
+            if existing_video_id:
+                logger.info(
+                    f"[Pipeline] Scene {scene_idx}: resuming existing video task "
+                    f"{existing_video_id[:16]}..."
+                )
+                end_frame_path = os.path.join(scene_dir, "end_frame.png")
+                pending.append({
+                    "scene_idx": scene_idx,
+                    "video_path": video_path,
+                    "video_id": existing_video_id,
+                    "scene_dir": scene_dir,
+                    "already_submitted": True,
+                })
+                current_first_frame = end_frame_path
+                continue
+
+            if str(scene_idx) in pregenerated_end_frames:
+                end_frame_path = pregenerated_end_frames[str(scene_idx)]
+            else:
+                end_frame_path = os.path.join(scene_dir, "end_frame.png")
+                if not os.path.exists(end_frame_path):
+                    user_ef = (
+                        end_frame_images[scene_idx]
+                        if end_frame_images and scene_idx < len(end_frame_images) and end_frame_images[scene_idx]
+                        else None
+                    )
+                    if user_ef and os.path.exists(user_ef):
+                        dest = os.path.join(scene_dir, "end_frame.png")
+                        await _run_ffmpeg_async(
+                            [
+                                "ffmpeg", "-y", "-i", user_ef,
+                                "-vf", f"scale={vw}:{vh}:force_original_aspect_ratio=decrease,pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2",
+                                dest,
+                            ],
+                            timeout=30,
+                        )
+                        end_frame_path = dest
+                    else:
+                        # 批次6：兖底尾帧生成与 Step 3.6 一致策略（i2i + 规范化角色图 + 拼合 prompt）
+                        end_frame_prompt = (
+                            end_frame_prompts[scene_idx]
+                            if scene_idx < len(end_frame_prompts)
+                            else _fallback_end_frame(scene_text)
+                        )
+                        use_i2i = (
+                            self._state.generate_end_frames_from_ref
+                            and reference_image
+                        )
+                        if use_i2i:
+                            # 程序化拼入 [PRESERVE] 角色外观硬约束
+                            # 用户提供了参考图时跳过，避免文本描述与参考图矛盾
+                            if self._state.character_appearance and not self._state.reference_image:
+                                _tags = _localize_preserve_tags(scene_text)
+                                end_frame_prompt = (
+                                    f"{_tags['preserve']}\n"
+                                    f"{self._state.character_appearance}\n"
+                                    f"{_tags['keep_identity']}\n\n"
+                                    f"{_tags['change']}\n"
+                                    f"{end_frame_prompt}"
+                                )
+                            normalized_ref = await self._get_normalized_character_ref(reference_image)
+                            logger.info(
+                                f"[Keyframes] Scene {scene_idx} fallback: i2i with normalized ref"
+                            )
+                            img_output = await self.image_generator.generate_single_image(
+                                prompt=end_frame_prompt,
+                                reference_image_paths=[normalized_ref],
+                                size=f"{vw}x{vh}",
+                            )
+                        else:
+                            img_output = await self.image_generator.generate_single_image(
+                                prompt=end_frame_prompt,
+                                size=f"{vw}x{vh}",
+                            )
+                        img_output.save(end_frame_path)
+
+            first_frame_url = await self.video_generator._resolve_image_ref(current_first_frame)
+            end_frame_url = await self.video_generator._resolve_image_ref(end_frame_path)
+
+            pending.append({
+                "scene_idx": scene_idx,
+                "scene_text": scene_text,
+                "video_path": video_path,
+                "first_frame_url": first_frame_url,
+                "end_frame_url": end_frame_url,
+                "end_frame_path": end_frame_path,
+                "scene_dir": scene_dir,
+                "already_submitted": False,
+            })
+            current_first_frame = end_frame_path
+
+        new_submissions = [i for i in pending if not i.get("already_submitted")]
+        if new_submissions:
+            await self._emit(
+                "video_gen", "running",
+                f"提交 {len(new_submissions)} 个视频任务 (keyframes)...",
+                0.35,
+            )
+        else:
+            logger.info(
+                f"[Pipeline] All {len(pending)} scene(s) already submitted, "
+                f"waiting for completion..."
+            )
+
+        for info in new_submissions:
+            scene_idx = info["scene_idx"]
+            await self._emit(
+                "video_gen", "running",
+                f"场景 {scene_idx+1}/{total}: 提交任务...",
+                0.35 + 0.05 * scene_idx / total,
+            )
+            video_id = await self.video_generator.submit_video(
+                prompt=info["scene_text"],
+                reference_image_paths=[info["first_frame_url"], info["end_frame_url"]],
+                duration=self._scene_duration(scene_idx),
+                width=vw,
+                height=vh,
+                negative_prompt=self._state.negative_prompt or None,
+            )
+            info["video_id"] = video_id
+            info["already_submitted"] = True
+            self._save_scene_task(info["scene_dir"], video_id)
+
+        if pending:
+            await self._emit(
+                "video_gen", "running",
+                f"等待 {len(pending)} 个视频生成完成...",
+                0.4,
+            )
+
+        for info in pending:
+            scene_idx = info["scene_idx"]
+            await self._emit(
+                "video_gen", "running",
+                f"场景 {scene_idx+1}/{total}: 等待生成中...",
+                0.4 + 0.4 * pending.index(info) / len(pending),
+            )
+            try:
+                video_output = await self.video_generator.wait_for_video(info["video_id"])
+                video_output.save(info["video_path"])
+                await self._emit(
+                    "video_gen", "running",
+                    f"场景 {scene_idx+1}/{total}: 完成",
+                    0.4 + 0.4 * (pending.index(info) + 1) / len(pending),
+                )
+            except Exception as e:
+                logger.error(f"Scene {scene_idx} video failed: {e}")
+                task_file = os.path.join(info["scene_dir"], "task.json")
+                if os.path.exists(task_file):
+                    os.remove(task_file)
+                raise
+
+        all_video_paths: List[str] = []
+        for scene_idx in range(len(scenes)):
+            video_path = os.path.join(self.working_dir, f"scene_{scene_idx}", "video.mp4")
+            if os.path.exists(video_path):
+                all_video_paths.append(video_path)
+
+        return all_video_paths
+
+    # ==================================================================
+    # Step 4.5: Populate narrations from story
+    # ==================================================================
+
+    def _is_narrative_para(self, text: str) -> bool:
+        t = text.strip()
+        if len(t) < 40:
+            return False
+        lower = t.lower()
+        skip_prefixes = (
+            "story title", "target audience", "story outline",
+            "main character", "character introduction", "full story narrative",
+            "故事标题", "目标受众", "故事大纲",
+            "角色介绍", "主要角色", "故事梗概",
+            "**故事标题", "**目标受众", "**故事大纲",
+            "**角色介绍", "**主要角色",
+        )
+        for p in skip_prefixes:
+            if lower.startswith(p):
+                return False
+        return True
+
+    def _populate_narrations(self, story: str) -> None:
+        num_scenes = len(self._state.scenes)
+        if not num_scenes or not story:
+            return
+
+        # On resume, re-trim existing narrations (old untrimmed data may persist)
+        if self._state.narrations:
+            _scenes = self._state.scenes
+            needs_update = any(
+                len(n) > max(int((_scenes[i].duration if i < len(_scenes) else self._state.video_duration) * _CHARS_PER_SEC), 20)
+                for i, n in enumerate(self._state.narrations)
+            )
+            if needs_update:
+                self._state.narrations = [
+                    _trim_to_sentence(
+                        n,
+                        max(int((_scenes[i].duration if i < len(_scenes) else self._state.video_duration) * _CHARS_PER_SEC), 20),
+                    )
+                    for i, n in enumerate(self._state.narrations)
+                ]
+                self.task_manager.update_state(narrations=self._state.narrations)
+            return
+
+        paragraphs = [p.strip() for p in story.split("\n\n") if p.strip()]
+        if not paragraphs:
+            self._state.narrations = [story] * num_scenes
+            self.task_manager.update_state(narrations=self._state.narrations)
+            return
+
+        # Filter out metadata paragraphs (title, audience, outline, character intro)
+        narrative_paras = [p for p in paragraphs if self._is_narrative_para(p)]
+        if not narrative_paras:
+            narrative_paras = paragraphs
+
+        narrations = []
+        base = len(narrative_paras) // num_scenes
+        rem = len(narrative_paras) % num_scenes
+        idx = 0
+        for i in range(num_scenes):
+            count = base + (1 if i < rem else 0)
+            narrations.append("\n".join(narrative_paras[idx : idx + count]))
+            idx += count
+
+        # Trim each narration to fit within its scene's duration * 4 chars/sec speaking rate
+        _scenes = self._state.scenes
+        narrations = [
+            _trim_to_sentence(
+                n,
+                max(int((_scenes[i].duration if i < len(_scenes) else self._state.video_duration) * _CHARS_PER_SEC), 20),
+            )
+            for i, n in enumerate(narrations)
+        ]
+
+        self._state.narrations = narrations
+        self.task_manager.update_state(narrations=narrations)
+
+    async def _step_generate_narrations(self, story: str, scenes: list) -> None:
+        """Use LLM to generate a single narration text for the entire video.
+
+        Generates ONE continuous narration that covers all scenes, with length
+        matching the total video duration (sum of per-scene durations).
+
+        Args:
+            story: Full story text for context.
+            scenes: List of scene visual prompts from write_script.
+        """
+        total_duration = sum(float(s.duration) for s in self._state.scenes)
+        single_narration = self._state.narrations[0] if self._state.narrations else ""
+
+        if single_narration and len(single_narration) > 5:
+            logger.info("[Pipeline] Step generate_narrations: SKIP (narration already populated)")
+            return
+
+        if not self._state.scenes:
+            return
+
+        logger.info("[Pipeline] Step generate_narrations: RUNNING (single narration for entire video)")
+        await self._emit("narrations", "running", "正在生成旁白文案...", 0.12)
+
+        narration = await asyncio.to_thread(
+            self.screenwriter.generate_narration_for_video,
+            story,
+            scenes,
+            total_duration,
+            self._state.style,
+        )
+
+        if not narration or len(narration) < 5:
+            logger.warning("[Pipeline] LLM returned empty narration, using fallback")
+            max_chars = max(int(total_duration * _CHARS_PER_SEC), 40)
+            narration = _trim_to_sentence(story, max_chars) if story else ""
+
+        self._state.narrations = [narration]
+        self.task_manager.update_state(narrations=[narration])
+        logger.info(f"[Pipeline] Narration generated: {len(narration)} chars for {total_duration:.0f}s video")
+
+        # 记录自动生成的 prompt（脚本 + 旁白）
+        # 场景 prompt 存储在 script.json 中，而非 SceneTask 对象上
+        script_prompts: list = []
+        script_path = os.path.join(self.working_dir, "script.json")
+        if os.path.exists(script_path):
+            try:
+                with open(script_path, "r", encoding="utf-8") as f:
+                    script_prompts = json.load(f)
+            except Exception:
+                pass
+        prompts_data = {
+            "scenes": script_prompts,
+            "narrations": self._state.narrations,
+            "script": script_prompts,
+        }
+        self.save_prompts(prompts_data)
+
+    # ==================================================================
+    # Step 5: Audio Generation (v3.0 split from subtitle)
+    # ==================================================================
+
+    async def _step_audio(self) -> Optional[object]:
+        """Generate TTS narration audio (or silent fallback) for the entire video.
+
+        Returns:
+            SubMaker cues object if TTS succeeded, None if silent/disabled.
+            Used by _step_subtitle for word-level subtitle timing.
+        """
+        # v3.0 backward compat: check old combined step status
+        if self._state.step_audio == StepStatus.COMPLETED:
+            logger.info("[Pipeline] Step audio: SKIP (already completed)")
+            return None
+        if (self._state.step_audio == StepStatus.PENDING
+                and self._state.step_audio_subtitle == StepStatus.COMPLETED):
+            logger.info("[Pipeline] Step audio: SKIP (v2.0 step_audio_subtitle completed)")
+            self._state.step_audio = StepStatus.COMPLETED
+            self.task_manager.update_step("step_audio", StepStatus.COMPLETED)
+            return None
+
+        combined_audio = os.path.join(self.working_dir, "combined_narration.mp3")
+        if os.path.exists(combined_audio) and os.path.getsize(combined_audio) > 0:
+            logger.info("[Pipeline] Step audio: SKIP (file exists)")
+            self._state.step_audio = StepStatus.COMPLETED
+            self.task_manager.update_step("step_audio", StepStatus.COMPLETED)
+            return None
+
+        audio_enabled = self._state.audio_config.enabled
+        narration_text = self._state.narrations[0] if self._state.narrations else ""
+        total_duration = sum(float(s.duration) for s in self._state.scenes)
+
+        logger.info(
+            f"[Pipeline] Step audio: RUNNING "
+            f"(enabled={audio_enabled}, narration={len(narration_text)} chars)"
+        )
+        await self._emit(
+            "audio", "running",
+            "生成旁白音频..." if audio_enabled else "生成静音时间轴...",
+            0.82,
+        )
+
+        sub_maker = None
+        if audio_enabled and narration_text:
+            edge_tts = EdgeTTSEngine()
+            try:
+                audio_path, sub_maker = await edge_tts.generate(
+                    text=narration_text,
+                    output_path=combined_audio,
+                    voice=self._state.audio_config.voice,
+                    rate=self._state.audio_config.rate,
+                )
+            except RuntimeError as e:
+                logger.warning(f"[Pipeline] EdgeTTS failed, falling back to silent: {e}")
+                silent_tts = SilentTTSEngine()
+                await silent_tts.generate(
+                    text=narration_text or "placeholder",
+                    output_path=combined_audio,
+                    duration_sec=total_duration,
+                )
+        else:
+            silent_tts = SilentTTSEngine()
+            await silent_tts.generate(
+                text=narration_text or "placeholder",
+                output_path=combined_audio,
+                duration_sec=total_duration,
+            )
+
+        for scene in self._state.scenes:
+            scene.narration_audio = combined_audio
+        self.task_manager.update_state(
+            scenes=[s.model_dump() for s in self._state.scenes],
+        )
+
+        self._state.step_audio = StepStatus.COMPLETED
+        self.task_manager.update_state(step_audio=StepStatus.COMPLETED)
+        await self._emit("audio", "completed", "音频生成完成", 0.86)
+        return sub_maker
+
+    # ==================================================================
+    # Step 6: Subtitle Generation (v3.0 split from audio)
+    # ==================================================================
+
+    async def _step_subtitle(self, sub_maker: Optional[object] = None) -> None:
+        """Generate SRT subtitles for the entire video.
+
+        Uses SubMaker cues from TTS (if available) or plain-text fallback.
+
+        Args:
+            sub_maker: SubMaker cues from _step_audio, or None.
+        """
+        # v3.0 backward compat
+        if self._state.step_subtitle == StepStatus.COMPLETED:
+            logger.info("[Pipeline] Step subtitle: SKIP (already completed)")
+            return
+        if (self._state.step_subtitle == StepStatus.PENDING
+                and self._state.step_audio_subtitle == StepStatus.COMPLETED):
+            logger.info("[Pipeline] Step subtitle: SKIP (v2.0 step_audio_subtitle completed)")
+            self._state.step_subtitle = StepStatus.COMPLETED
+            self.task_manager.update_step("step_subtitle", StepStatus.COMPLETED)
+            return
+
+        combined_srt = os.path.join(self.working_dir, "combined_narration.srt")
+        if os.path.exists(combined_srt) and os.path.getsize(combined_srt) > 0:
+            logger.info("[Pipeline] Step subtitle: SKIP (file exists)")
+            self._state.step_subtitle = StepStatus.COMPLETED
+            self.task_manager.update_step("step_subtitle", StepStatus.COMPLETED)
+            return
+
+        subtitle_enabled = self._state.subtitle_config.enabled
+        narration_text = self._state.narrations[0] if self._state.narrations else ""
+
+        logger.info(
+            f"[Pipeline] Step subtitle: RUNNING "
+            f"(enabled={subtitle_enabled}, narration={len(narration_text)} chars, "
+            f"scenes={len(self._state.scenes)})"
+        )
+        await self._emit(
+            "subtitle", "running",
+            "生成字幕..." if subtitle_enabled else "跳过字幕生成",
+            0.86,
+        )
+
+        num_scenes = len(self._state.scenes)
+
+        # ── 准备场景文本和时长 ──
+        if num_scenes > 1:
+            scene_texts = self._state.narrations[:]
+            if len(scene_texts) == 1 and num_scenes > 1:
+                scene_texts = _split_narration_into_scenes(
+                    narration_text, num_scenes,
+                )
+        else:
+            scene_texts = [narration_text] if narration_text else [""]
+
+        scene_durations = (
+            [float(s.duration) for s in self._state.scenes]
+            if self._state.scenes
+            else [float(self._state.video_duration)]
+        )
+
+        srt_path, styles_path = await self.generate_subtitles_common(
+            segment_texts=scene_texts,
+            segment_durations=scene_durations,
+            subtitle_config=self._state.subtitle_config,
+            sub_maker=sub_maker,
+            audio_path=os.path.join(self.working_dir, "combined_narration.mp3"),
+            srt_filename="combined_narration.srt",
+            screenwriter=self.screenwriter,
+            video_width=self._state.video_width,
+            video_height=self._state.video_height,
+        )
+
+        if styles_path:
+            self._state.subtitle_styles_path = styles_path
+            self.task_manager.update_state(subtitle_styles_path=styles_path)
+
+            # 追加字幕样式 prompt 到 prompts.json
+            try:
+                prompts_path = os.path.join(self.working_dir, "prompts.json")
+                existing = {}
+                if os.path.exists(prompts_path):
+                    with open(prompts_path, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                with open(styles_path, "r", encoding="utf-8") as f:
+                    existing["subtitle_styles"] = json.load(f)
+                self.save_prompts(existing)
+            except Exception:
+                pass
+
+        for scene in self._state.scenes:
+            scene.subtitle_srt = srt_path
+        self.task_manager.update_state(
+            scenes=[s.model_dump() for s in self._state.scenes],
+        )
+
+        self._state.step_subtitle = StepStatus.COMPLETED
+        self.task_manager.update_state(step_subtitle=StepStatus.COMPLETED)
+        await self._emit("subtitle", "completed", "字幕生成完成", 0.9)
+
+    # ==================================================================
+    # Step 6: Concatenation (MODIFIED in v2.0)
+    # ==================================================================
+
+    async def _step_concatenate(self, all_video_paths: list) -> str:
+        """Concatenate scene videos into the final output.
+
+        When audio is enabled, uses the single combined audio+subtitle track
+        (from _step_audio_subtitle) and overlays it on the concatenated video.
+
+        Falls back to :meth:`VideoConcatenator.concat_videos` when audio is
+        disabled or unavailable.
+
+        Args:
+            all_video_paths: Ordered list of per-scene video file paths.
+
+        Returns:
+            Path to the final concatenated video file.
+
+        Raises:
+            RuntimeError: If no videos were generated.
+        """
+        final_video_path = os.path.join(self.working_dir, "final_video.mp4")
+
+        if os.path.exists(final_video_path):
+            self._state.step_concatenation = StepStatus.COMPLETED
+            self._state.final_video_file = final_video_path
+            self.task_manager.update_state(
+                step_concatenation=StepStatus.COMPLETED,
+                final_video_file=final_video_path,
+            )
+            return final_video_path
+
+        await self._emit("concatenate", "running", "正在拼接视频...", 0.92)
+
+        has_audio = self._state.audio_config.enabled
+        has_subtitle = self._state.subtitle_config.enabled
+        combined_audio = os.path.join(self.working_dir, "combined_narration.mp3")
+        combined_srt = os.path.join(self.working_dir, "combined_narration.srt")
+
+        # Phase 2: LLM 样式 JSON 路径
+        styles_path = self._state.subtitle_styles_path or ""
+        if styles_path and not os.path.exists(styles_path):
+            styles_path = ""
+
+        if has_audio or has_subtitle:
+            audio_exists = os.path.exists(combined_audio) and os.path.getsize(combined_audio) > 0
+            srt_exists = os.path.exists(combined_srt) and os.path.getsize(combined_srt) > 0
+
+            if audio_exists:
+                await asyncio.to_thread(
+                    VideoConcatenator.concat_videos_with_audio_overlay,
+                    video_paths=all_video_paths,
+                    audio_path=combined_audio,
+                    srt_path=combined_srt if (has_subtitle and srt_exists) else None,
+                    output_path=final_video_path,
+                    subtitle_style=self._state.subtitle_config.style if has_subtitle else None,
+                    subtitle_styles_path=styles_path if styles_path else None,
+                )
+            else:
+                await asyncio.to_thread(
+                    VideoConcatenator.concat_videos, all_video_paths, final_video_path
+                )
+        else:
+            await asyncio.to_thread(
+                VideoConcatenator.concat_videos, all_video_paths, final_video_path
+            )
+
+        self._state.step_concatenation = StepStatus.COMPLETED
+        self._state.final_video_file = final_video_path
+        self.task_manager.update_state(
+            step_concatenation=StepStatus.COMPLETED,
+            final_video_file=final_video_path,
+        )
+        await self._emit("concatenate", "completed", "视频拼接完成", 0.95)
+        return final_video_path
+
+    # ==================================================================
+    # Main Run
+    # ==================================================================
+
+    async def run(self, state: CreativeVideoTask) -> str:
+        """Execute the full creative video generation pipeline.
+
+        Steps (in order):
+            0. Image analysis
+            1. Story generation
+            2. Character reference
+            3. Script writing
+            3.5. End-frame prompts (keyframes mode)
+            3.6. End-frame pre-generation (keyframes mode)
+            4. Video generation
+            5. Audio & subtitle generation (v2.0)
+            6. Concatenation
+
+        Each step is checkpointed for resume.  A ``PipelineShutdown`` exception
+        is raised at every checkpoint when a shutdown is requested.
+
+        Args:
+            state: The creative video task state to execute.
+
+        Returns:
+            Path to the final video file.
+
+        Raises:
+            PipelineShutdown: If a graceful shutdown was requested.
+            Exception: On unrecoverable errors (state is marked FAILED).
+        """
+        self._state = state
+        self._state.status = StepStatus.RUNNING
+        self.task_manager.create(self._state)
+
+        await self._emit("init", "running", "开始视频生成流程...", 0.0)
+
+        try:
+            # ── v3.x: Scene info — extract or validate ──
+            await self._step_resolve_scene_config()
+
+            image_context = await self._step_image_analysis(
+                self._state.reference_image, self._state.end_frame_images
+            )
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after image analysis")
+
+            story = await self._step_story(image_context)
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after story")
+
+            character_ref_path = await self._step_character_reference(story)
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after character reference")
+
+            scenes = await self._step_script(story)
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after script")
+
+            # Generate narrations using LLM (replaces direct story content usage)
+            await self._step_generate_narrations(story, scenes)
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after narrations")
+
+            end_frame_prompts = await self._step_end_frame_prompts(story, scenes)
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after end frame prompts")
+
+            pregenerated_end_frames = await self._step_pregenerate_end_frames(
+                scenes, end_frame_prompts, character_ref_path
+            )
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after end frame generation")
+
+            all_video_paths = await self._step_generate_videos(
+                scenes, character_ref_path, end_frame_prompts, pregenerated_end_frames
+            )
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after video generation")
+
+            # v3.0: audio generation
+            sub_maker = await self._step_audio()
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after audio")
+
+            # v3.0: subtitle generation (separate from audio)
+            await self._step_subtitle(sub_maker)
+            if self._is_shutdown():
+                raise PipelineShutdown("interrupted after subtitle")
+
+            final_video_path = await self._step_concatenate(all_video_paths)
+
+            # 水印后处理
+            wm_config = get_watermark_config()
+            if wm_config.get("enabled") and os.path.exists(final_video_path):
+                lang = wm_config.get("language", "auto")
+                if lang == "auto":
+                    lang = detect_language(self._state.idea)
+                wm_output = final_video_path + ".wm_tmp.mp4"
+                if add_watermark(
+                    final_video_path, wm_output,
+                    language=lang,
+                ):
+                    os.replace(wm_output, final_video_path)
+
+            self._state.status = StepStatus.COMPLETED
+            self.task_manager.update_state(status=StepStatus.COMPLETED)
+            await self._emit(
+                "done", "completed", "视频生成完成!", 1.0,
+                {"final_video": final_video_path},
+            )
+
+            return final_video_path
+
+        except PipelineShutdown as e:
+            logger.info(f"[Pipeline] Shutdown: {e}")
+            await self._emit("error", "failed", "任务已被中断，可从任务列表续传", 0.0)
+            raise
+        except Exception as e:
+            self._state.status = StepStatus.FAILED
+            self.task_manager.update_state(status=StepStatus.FAILED)
+            await self._emit("error", "failed", str(e), 0.0)
+            raise

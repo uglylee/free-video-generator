@@ -1,0 +1,14 @@
+# Keep the build context small and — critically — keep the API key out of the
+# image. AGNES_API_KEY is injected at runtime via env_file, never baked in.
+.env
+.git
+.venv
+.working_dir
+.agnes_config
+.workbuddy
+.writing
+**/__pycache__
+*.pyc
+*.pyo
+.DS_Store
+.regression_server.log

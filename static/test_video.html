@@ -1,0 +1,24 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Video Test</title></head>
+<body style="background:#111;color:#fff;padding:20px">
+<h2>Video Playback Test</h2>
+<p>If video plays below, the server and codec are fine — the bug is in the main app's JS.</p>
+<hr>
+<h3>Task 23f233d77266 (15s, 832x1088)</h3>
+<video id="v1" controls width="400" src="/api/video/23f233d77266"></video>
+<hr>
+<h3>Task 83bbcfe11d17 (6s, 448x832)</h3>
+<video id="v2" controls width="400" src="/api/video/83bbcfe11d17"></video>
+<hr>
+<p id="v1_status">v1 loadState: —</p>
+<p id="v2_status">v2 loadState: —</p>
+<script>
+['v1','v2'].forEach(id => {
+  const v = document.getElementById(id);
+  const s = document.getElementById(id+'_status');
+  v.addEventListener('loadeddata',  () => s.textContent = id + ' loadeddata ✅');
+  v.addEventListener('error',       () => s.textContent = id + ' error ❌ code=' + v.error?.code + ' msg=' + v.error?.message);
+  v.addEventListener('play',        () => s.textContent = id + ' playing ▶️');
+  v.addEventListener('waiting',     () => s.textContent = id + ' waiting/buffering…');
+});
+</script>
+</body></html>

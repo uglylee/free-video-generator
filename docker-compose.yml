@@ -1,0 +1,19 @@
+services:
+  agnes-video:
+    build: .
+    image: agnes-video-generator
+    container_name: agnes-video
+    ports:
+      - "8765:8765"
+    # AGNES_API_KEY (and optional AGNES_RATE_LIMIT) come from .env at runtime.
+    env_file:
+      - .env
+    volumes:
+      # Persist generated artifacts + checkpoint state across restarts.
+      - ./.working_dir:/app/.working_dir
+      # Persist the key/config if set through the Web UI instead of .env.
+      - ./.agnes_config:/app/.agnes_config
+      - ./static:/app/static
+
+    
+    restart: unless-stopped
