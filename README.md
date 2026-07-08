@@ -415,10 +415,7 @@ Bug reports and feature suggestions are welcome via [GitHub Issues](../../issues
 
 Free Video Generator is and will always remain completely free and open-source. There will be **no paid plans, no premium features, and no subscription services** — now or in the future.
 
-If you find this project helpful, here are a few ways to support its continued development:
 
-- **Whitelist the official website** — Turn off your ad blocker on [video.lichuanyang.top](https://video.lichuanyang.top) and click on an ad if something catches your eye. A small gesture that makes a real difference.
-- **Share your creations** — Post videos made with Free Video Generator on social media (Douyin, YouTube, Xiaohongshu, etc.) and tag the project. More exposure means more users, more feedback, and a better tool for everyone.
 
 ## License
 
