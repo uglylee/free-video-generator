@@ -1,9 +1,5 @@
 # Free Video Generator — Completely Free AI Video Generator
 
-[![GitHub Stars](https://img.shields.io/github/stars/lcy362/free-video-generator?style=social)](https://github.com/lcy362/free-video-generator)
-[![License](https://img.shields.io/github/license/lcy362/free-video-generator)](https://github.com/lcy362/free-video-generator/blob/main/LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
-[![Website](https://img.shields.io/badge/website-video.lichuanyang.top-8A2BE2)](https://video.lichuanyang.top)
 
 > **Completely free AI video generator** — Built on Agnes AI's free models, no subscription, no high-end GPU, no usage limits. Type in a text idea and automatically generate multi-scene AI videos with narration and subtitles. Supports text-to-video, image-to-video, keyframes animation, digital anchor, and more. All AI compute runs in the cloud — a regular laptop is all you need. **[Try it online →](https://video.lichuanyang.top)**
 
@@ -143,7 +139,7 @@ That's it. No GPU, no large RAM, a regular laptop is all you need.
 **Step 1 — Clone & Launch**
 
 ```bash
-git clone https://github.com/lcy362/free-video-generator.git
+git clone https://github.com/uglylee/free-video-generator.git
 cd free-video-generator
 ./start.sh
 ```
@@ -179,7 +175,7 @@ Open `http://localhost:8765`, choose a video mode (Simple / Creative / Manuscrip
 This project is designed for AI coding assistants. First, download the code and prepare your API key:
 
 ```bash
-git clone https://github.com/lcy362/free-video-generator.git
+git clone https://github.com/uglylee/free-video-generator.git
 cd free-video-generator
 ```
 
@@ -460,6 +456,6 @@ Absolutely. The project is designed for self-hosting. Just clone the repo, run `
 
 ### How do I get help or report issues?
 
-Check the [GitHub Issues](https://github.com/lcy362/free-video-generator/issues) page for existing reports or open a new one. The project also includes a comprehensive `AGENTS.md` for AI-agent-assisted debugging. For feature requests, bug reports, or questions, the Issues page is the best place.
+Check the [GitHub Issues](https://github.com/uglylee/free-video-generator/issues) page for existing reports or open a new one. The project also includes a comprehensive `AGENTS.md` for AI-agent-assisted debugging. For feature requests, bug reports, or questions, the Issues page is the best place.
 
 **Keywords**: free AI video generator, AI video generation tool, text to video AI, free AI video maker, AI video creator, open source video generator, text-to-video, image-to-video, keyframes video, AI narration, auto subtitles, multi-scene video, zero cost AI video, no subscription AI video tool, digital anchor, self-hosted AI video generator, open source alternative to Runway
