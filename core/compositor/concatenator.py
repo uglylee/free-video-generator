@@ -114,7 +114,7 @@ class VideoConcatenator:
         """
         from core.audio.subtitle import SubtitleGenerator
         return SubtitleGenerator.resolve_position(
-            pos, video_width or 1920, video_height or 1080,
+            pos, video_width or 1920, video_height,
         )
 
     @staticmethod

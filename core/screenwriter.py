@@ -41,7 +41,7 @@ class Screenwriter:
         self.chat_api = AgnesChatAPI(api_key=api_key, model=model)
         # 保持旧 headers 供直接引用（兼容）
         self.headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": "Bearer " + getattr(self, "api_key"),
             "Content-Type": "application/json",
         }
 
