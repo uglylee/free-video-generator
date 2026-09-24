@@ -381,6 +381,7 @@
         <div class="mb-4">
           <label class="block text-sm text-gray-400 mb-1.5"><span data-i18n="promptLabel">视频描述</span> (prompt) <span class="text-red-400">*</span></label>
           <textarea id="s_prompt" rows="3" data-i18n-placeholder="promptPlaceholder" placeholder="描述你想要的视频画面..." class="w-full glass-input rounded-lg px-4 py-2.5 text-sm resize-y text-gray-100 placeholder-gray-600"></textarea>
+          <button type="button" onclick="generateTomCatVideo()" class="mt-2 text-xs text-green-700 hover:text-green-800 transition">🐱 Generate a Tom Cat video</button>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
@@ -3012,6 +3013,14 @@ async function submitSimple() {
     alert(t('failCreate') + ': ' + e.message);
     btn.disabled = false; btn.textContent = t('startGenerate');
   }
+}
+
+function generateTomCatVideo() {
+  document.getElementById('s_prompt').value =
+    'Tom Cat playfully chasing Jerry through a colorful kitchen, expressive cartoon animation, dynamic camera movement, high detail';
+  document.getElementById('s_mode').value = 't2v';
+  onSimpleModeChange();
+  submitSimple();
 }
 
 // ── Scene Configuration UI ──
