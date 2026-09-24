@@ -672,10 +672,14 @@ class SubtitleGenerator:
         h_resolved = resolve_h(h_raw)
         v_resolved = resolve_v(v_raw)
 
-        # safe-margin clamping for pixel positions
-        if isinstance(h_resolved, (int, float)):
+        h_is_offset = isinstance(h_raw, str) and bool(__import__('re').match(r'^(left|right)\s*(?:\+|[-?])', str(h_raw).strip().lower()))
+        v_is_offset = isinstance(v_raw, str) and bool(__import__('re').match(r'^(top|bottom)\s*(?:\+|[-?])', str(v_raw).strip().lower()))
+
+        # safe-margin clamping for pixel positions; explicit relative offsets such as
+        # "top+50" / "bottom-80" are intentionally relative to the frame edge.
+        if isinstance(h_resolved, (int, float)) and video_width > 0 and not h_is_offset:
             h_resolved = max(safe_margin_x, min(h_resolved, video_width - safe_margin_x))
-        if isinstance(v_resolved, (int, float)):
+        if isinstance(v_resolved, (int, float)) and video_height > 0 and not v_is_offset:
             v_resolved = max(safe_margin_y, min(v_resolved, video_height - safe_margin_y))
 
         return (h_resolved, v_resolved)

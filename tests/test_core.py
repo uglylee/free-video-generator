@@ -22,6 +22,29 @@ import pytest
 
 
 # ═══════════════════════════════════════════════════
+# 0. Agnes API authentication
+# ═══════════════════════════════════════════════════
+
+class TestAgnesApiAuthentication:
+    """API clients must forward the configured key to Agnes."""
+
+    def test_video_client_uses_configured_api_key(self):
+        from core.api.agnes_video import AgnesVideoAPI
+        client = AgnesVideoAPI("test-key")
+        assert client.headers["Authorization"] == "Bearer test-key"
+
+    def test_image_client_uses_configured_api_key(self):
+        from core.api.agnes_image import AgnesImageAPI
+        client = AgnesImageAPI("test-key")
+        assert client.headers["Authorization"] == "Bearer test-key"
+
+    def test_chat_client_uses_configured_api_key(self):
+        from core.api.agnes_chat import AgnesChatAPI
+        client = AgnesChatAPI("test-key")
+        assert client.headers["Authorization"] == "Bearer test-key"
+
+
+# ═══════════════════════════════════════════════════
 # 1. models/task.py
 # ═══════════════════════════════════════════════════
 

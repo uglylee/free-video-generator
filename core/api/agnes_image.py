@@ -86,7 +86,7 @@ class AgnesImageAPI:
         env_i2i = os.environ.get("AGNES_IMAGE_I2I_MODEL")
         self.i2i_model = i2i_model or env_i2i or model
         self.headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": "Bearer " + getattr(self, "api_key"),
             "Content-Type": "application/json",
         }
 

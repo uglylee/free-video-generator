@@ -60,7 +60,7 @@ class AgnesVideoAPI:
         self.retry_base_delay = retry_base_delay
         self.shutdown_event = None
         self.headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": "Bearer " + getattr(self, "api_key"),
             "Content-Type": "application/json",
         }
 

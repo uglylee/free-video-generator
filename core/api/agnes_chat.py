@@ -58,7 +58,7 @@ class AgnesChatAPI:
         self.api_key = api_key
         self.model = model
         self.headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": "Bearer " + getattr(self, "api_key"),
             "Content-Type": "application/json",
         }
 

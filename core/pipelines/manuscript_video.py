@@ -320,8 +320,8 @@ class ManuscriptVideoPipeline(BasePipeline):
         if text != self._state.manuscript_text:
             logger.info("[Manuscript] split_text: fixed double-encoded UTF-8 text")
             self._state.manuscript_text = text
-            self.task_manager.update_state(manuscript_text=text)
-
+            if hasattr(self, "task_manager"):
+                self.task_manager.update_state(manuscript_text=text)
         # Resume: if paragraphs already populated, return them directly.
         if self._state.paragraphs:
             logger.info(
